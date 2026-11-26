@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
         with:
@@ -28,6 +28,16 @@ jobs:
           cat "$RUNNER_TEMP/before.txt"
           test "$status" -eq 1
           grep -F 'assert [1] == [0]' "$RUNNER_TEMP/before.txt"
+          git restore --source HEAD handqa/hitl_runner.py
+      - name: Reproduce delayed shade Stop on the first narration patch
+        run: |
+          set -euo pipefail
+          git restore --source 484a171819af59f32ed32855a7c381abb914b6a3 handqa/hitl_runner.py
+          status=0
+          uv run --locked --group dev pytest -q tests/test_speech.py -k shade_stop_cuts_the_voice_after_typing > "$RUNNER_TEMP/shade-stop-before.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/shade-stop-before.txt"
+          test "$status" -eq 1
+          grep -F 'assert [0] == [1]' "$RUNNER_TEMP/shade-stop-before.txt"
           git restore --source HEAD handqa/hitl_runner.py
       - name: Verify the fixed runner
         run: uv run --locked --group dev pytest -q

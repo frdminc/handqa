@@ -908,6 +908,7 @@ def _run_trials(
             if now - last_stop_check >= STOP_CHECK_S:
                 last_stop_check = now
                 if _phone_stopped(gate):
+                    voice.interrupt()
                     error = STOPPED
                     break
             try:
