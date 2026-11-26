@@ -392,7 +392,9 @@ class Recorder:
         """Stop filming the screen and reading the keys; `finish` writes the file later. Safe to repeat."""
         if self._captured is not None:
             return
-        length = self._clock() - self._t0
+        stopped_at = self._clock()
+        self.on_speech("cut", time=stopped_at)
+        length = stopped_at - self._t0
         self._show_touches(False)
         keys: list[Shown] = []
         touches: list[Shown] = []
@@ -492,16 +494,15 @@ def recording(
     out_dir: Path | None = None,
     *,
     captured: Callable[[], None] | None = None,
-    stop_requested: Callable[[], bool] | None = None,
     **kwargs: Any,
 ) -> Iterator[Recorder | None]:
     """Record around a run when `enabled`; otherwise do nothing. Never prints.
 
     Raises RecordingError before the run if recording cannot start. On normal
-    completion it waits for the last spoken line before stopping capture.
-    A stop request ends that wait. If the run raises, capture stops without
-    waiting. Read `.output` and `.warnings` on the yielded Recorder afterwards.
-    `captured` runs once the phone is no longer filmed, before the file is written (which takes a while).
+    completion without a `captured` callback, it waits for the last spoken line.
+    With a callback or an interrupted run, capture stops without that wait.
+    `captured` runs once the phone is no longer filmed, before the file is written.
+    Read `.output` and `.warnings` on the yielded Recorder afterwards.
     """
     if not enabled:
         yield None
@@ -512,12 +513,10 @@ def recording(
         speaker.listener = recorder.on_speech
     try:
         yield recorder
-        wait = getattr(speaker, "wait_idle", None)
-        if callable(wait):
-            if stop_requested is None:
+        if captured is None:
+            wait = getattr(speaker, "wait_idle", None)
+            if callable(wait):
                 wait(IDLE_TIMEOUT_S)
-            else:
-                wait(IDLE_TIMEOUT_S, stop_requested=stop_requested)
     finally:
         if hasattr(speaker, "listener"):
             speaker.listener = None
