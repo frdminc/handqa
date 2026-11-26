@@ -492,14 +492,15 @@ def recording(
     out_dir: Path | None = None,
     *,
     captured: Callable[[], None] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
     **kwargs: Any,
 ) -> Iterator[Recorder | None]:
     """Record around a run when `enabled`; otherwise do nothing. Never prints.
 
     Raises RecordingError before the run if recording cannot start. On normal
     completion it waits for the last spoken line before stopping capture.
-    If the run raises, it stops capture without waiting. Read `.output` and
-    `.warnings` on the yielded Recorder afterwards.
+    A stop request ends that wait. If the run raises, capture stops without
+    waiting. Read `.output` and `.warnings` on the yielded Recorder afterwards.
     `captured` runs once the phone is no longer filmed, before the file is written (which takes a while).
     """
     if not enabled:
@@ -513,7 +514,10 @@ def recording(
         yield recorder
         wait = getattr(speaker, "wait_idle", None)
         if callable(wait):
-            wait(IDLE_TIMEOUT_S)
+            if stop_requested is None:
+                wait(IDLE_TIMEOUT_S)
+            else:
+                wait(IDLE_TIMEOUT_S, stop_requested=stop_requested)
     finally:
         if hasattr(speaker, "listener"):
             speaker.listener = None
