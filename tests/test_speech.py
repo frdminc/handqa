@@ -10,6 +10,7 @@ from handqa.hitl_runner import (
     HANDS_OFF,
     NOT_STARTED,
     REPROMPT,
+    STOPPED,
     ChordTrial,
     load_suite,
     run_chord_batch,
@@ -123,8 +124,10 @@ def test_voice_reprompts_after_a_quiet_spell_then_stops_the_batch():
     assert REPROMPT + "T2. digits: 42" in speaker.prepared
 
 
-def test_typing_ends_the_reprompts_and_the_trial_passes():
+def test_typing_ends_reprompts_without_cutting_the_voice(monkeypatch):
     speaker = _FakeSpeaker()
+    monkeypatch.setattr(speaker, "speaking", lambda: True)
+    cuts_at_result = []
     trial = ChordTrial(prompt="alpha: hello", expect="hello", speak="Type hello now")
     results = run_chord_batch(
         ScreenController(_Device(_Field(typed_after=6))),  # a few reads go to open/baseline
@@ -132,9 +135,31 @@ def test_typing_ends_the_reprompts_and_the_trial_passes():
         _console(),
         _Gate(),
         speaker,
+        on_result=lambda _number, _result: cuts_at_result.append(speaker.stops),
     )
     assert results[0].passed
+    assert cuts_at_result == [0]
     assert speaker.said == [HANDS_OFF, "T1. Type hello now", END_DONE_TEXT]
+
+
+def test_shade_stop_cuts_the_voice_after_typing(monkeypatch):
+    field = _Field(typed_after=6)
+    speaker = _FakeSpeaker()
+    monkeypatch.setattr(speaker, "speaking", lambda: speaker.stops == 0)
+    monkeypatch.setattr("handqa.hitl_runner.STOP_CHECK_S", 0)
+    monkeypatch.setattr("handqa.hitl_runner._phone_stopped", lambda _gate: field.reads > field.typed_after)
+    cuts_at_result = []
+    results = run_chord_batch(
+        ScreenController(_Device(field)),
+        [ChordTrial(prompt="alpha: hello world", expect="hello world", speak="Type hello world now")],
+        _console(),
+        _Gate(),
+        speaker,
+        on_result=lambda _number, _result: cuts_at_result.append(speaker.stops),
+    )
+    assert results[0].observed == "hello"
+    assert results[0].error == STOPPED
+    assert cuts_at_result == [1]
 
 
 def test_without_a_voice_the_old_start_window_still_applies():

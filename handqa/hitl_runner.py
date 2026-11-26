@@ -743,7 +743,7 @@ class _Reprompter:
         self.speaker.say(REPROMPT + self.text)
         return True
 
-    def started(self) -> None:
+    def interrupt(self) -> None:
         if self.speaker is not None and self.speaker.speaking():
             self.speaker.stop()
 
@@ -908,6 +908,7 @@ def _run_trials(
             if now - last_stop_check >= STOP_CHECK_S:
                 last_stop_check = now
                 if _phone_stopped(gate):
+                    voice.interrupt()
                     error = STOPPED
                     break
             try:
@@ -930,12 +931,11 @@ def _run_trials(
                     deadline = last_change + idle_after_input(trial)  # the timeout is idle time, not total time
             if changed and first is None and strip_sentinel(observed, trial.sentinel) != "":
                 first = time.perf_counter()
-                voice.started()
                 deadline = first + idle_after_input(trial)
             if overlay is not None:
                 button = overlay.pressed()
                 if button in ("done", "next", "stop"):
-                    voice.started()  # the person has acted: nobody waits for the prompt to finish
+                    voice.interrupt()  # the button explicitly ends or advances this trial
                 if button == "retry" or (button == "redo" and index > 0):
                     again = button
                     break
@@ -975,7 +975,7 @@ def _run_trials(
                 keyboard_before = None
                 console.print(f"T{number} keyboard state unavailable: {exc}", markup=False)
         if again:
-            voice.started()  # stop reading this trial's action
+            voice.interrupt()  # stop reading this trial's action
             if benched:
                 _bench_report(
                     probe, console, number, trial, strip_sentinel(observed, trial.sentinel), False, discarded=True

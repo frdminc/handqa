@@ -392,7 +392,9 @@ class Recorder:
         """Stop filming the screen and reading the keys; `finish` writes the file later. Safe to repeat."""
         if self._captured is not None:
             return
-        length = self._clock() - self._t0
+        stopped_at = self._clock()
+        self.on_speech("cut", time=stopped_at)
+        length = stopped_at - self._t0
         self._show_touches(False)
         keys: list[Shown] = []
         touches: list[Shown] = []
@@ -496,10 +498,11 @@ def recording(
 ) -> Iterator[Recorder | None]:
     """Record around a run when `enabled`; otherwise do nothing. Never prints.
 
-    Raises RecordingError before the run if recording cannot start. After the
-    run it waits for the last spoken line to finish, then writes the file;
-    read `.output` and `.warnings` on the yielded Recorder afterwards.
-    `captured` runs once the phone is no longer filmed, before the file is written (which takes a while).
+    Raises RecordingError before the run if recording cannot start. On normal
+    completion without a `captured` callback, it waits for the last spoken line.
+    With a callback or an interrupted run, capture stops without that wait.
+    `captured` runs once the phone is no longer filmed, before the file is written.
+    Read `.output` and `.warnings` on the yielded Recorder afterwards.
     """
     if not enabled:
         yield None
@@ -510,10 +513,11 @@ def recording(
         speaker.listener = recorder.on_speech
     try:
         yield recorder
+        if captured is None:
+            wait = getattr(speaker, "wait_idle", None)
+            if callable(wait):
+                wait(IDLE_TIMEOUT_S)
     finally:
-        wait = getattr(speaker, "wait_idle", None)
-        if callable(wait):
-            wait(IDLE_TIMEOUT_S)
         if hasattr(speaker, "listener"):
             speaker.listener = None
         recorder.stop_capture()
