@@ -1,0 +1,163 @@
+name: Release overlay APK
+
+on:
+  push:
+    tags:
+      - 'overlay-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. overlay-v0.4.1; defaults to overlay-v<versionName>-<sha8>)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  handqa-tests:
+    name: Python tests (handqa)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+
+      - name: Run pytest
+        run: |
+          set -euo pipefail
+          uv run --locked --group dev pytest -q
+
+  build:
+    name: Build & verify overlay APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      apk: ${{ steps.apk.outputs.apk }}
+      version_name: ${{ steps.apk.outputs.version_name }}
+      version_code: ${{ steps.apk.outputs.version_code }}
+      sha8: ${{ steps.apk.outputs.sha8 }}
+    env:
+      PROJECT: overlay-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: 'platform-tools build-tools;35.0.0 platforms;android-36'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: "8.13"
+
+      - name: Unit tests and assemble debug APK
+        run: |
+          set -euo pipefail
+          gradle -p "$PROJECT" --no-daemon --stacktrace testDebugUnitTest assembleDebug
+
+      - name: Verify APK and compute SHA-256
+        id: apk
+        run: |
+          set -euo pipefail
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          src="$PROJECT/app/build/outputs/apk/debug/app-debug.apk"
+          "$build_tools/aapt2" dump badging "$src" | grep -E "^(package|uses-permission|application-label)" | tee /tmp/badging.txt
+          if grep -q "android.permission.INTERNET" /tmp/badging.txt; then
+            echo "APK requests INTERNET" >&2
+            exit 1
+          fi
+          ver_name=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -n 1)
+          ver_code=$(sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -n 1)
+          test -n "$ver_name"
+          test -n "$ver_code"
+          sha8=${GITHUB_SHA:0:8}
+          apk="hitl-button-bar-${ver_name}-${sha8}.apk"
+          cp "$src" "$apk"
+          sha256sum "$apk" | tee "$apk.sha256"
+          {
+            echo "apk=$apk"
+            echo "version_name=$ver_name"
+            echo "version_code=$ver_code"
+            echo "sha8=$sha8"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hitl-button-bar-release
+          path: |
+            ${{ steps.apk.outputs.apk }}
+            ${{ steps.apk.outputs.apk }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [handqa-tests, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      APK: ${{ needs.build.outputs.apk }}
+      VERSION_NAME: ${{ needs.build.outputs.version_name }}
+      VERSION_CODE: ${{ needs.build.outputs.version_code }}
+      SHA8: ${{ needs.build.outputs.sha8 }}
+      INPUT_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Download verified APK artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: hitl-button-bar-release
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          sha256sum -c "$APK.sha256"
+          apk_sha=$(awk '{print $1}' "$APK.sha256")
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="overlay-v${VERSION_NAME}-${SHA8}"
+          fi
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          HITL button bar overlay app (\`dev.hitlbar.overlay\`) version \`${VERSION_NAME}\` (versionCode \`${VERSION_CODE}\`) built from commit \`${GITHUB_SHA}\`.
+
+          - Build: https://github.com/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}
+          - APK SHA-256: \`${apk_sha}\`
+
+          A test tool for Android developer devices (requires only \`SYSTEM_ALERT_WINDOW\`, no network permission).
+
+          Install:
+          \`\`\`bash
+          sha256sum -c ${APK}.sha256
+          adb install -r ${APK}
+          adb shell appops set dev.hitlbar.overlay SYSTEM_ALERT_WINDOW allow
+          \`\`\`
+          EOF
+          gh release create "$tag" "$APK" "$APK.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "HITL button bar ${VERSION_NAME} (${SHA8})" \
+            --notes-file "$notes"

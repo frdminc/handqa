@@ -1,0 +1,520 @@
+"""Host commands for the FIRERPA HITL harness."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import shutil
+import time
+from contextlib import ExitStack
+from pathlib import Path
+from typing import Any
+
+import typer
+from lamda.client import Selector
+from rich.console import Console
+
+from handqa.connection import connect as open_device
+from handqa.connection import require_version
+from handqa.controller import ScreenController
+from handqa.end_state import RELEASE_HINT, EndNotice
+from handqa.hitl_runner import allowed_packages, load_suite, plan_trials, read_suite, run_chord_batch
+from handqa import end_state, runlock
+from handqa.config import env_get, keyboard_package
+from handqa.ledger import TAIL_S, BuildError, Ledger, cut_clip, final_video, ime_build, require_keyboard_build
+from handqa.keys import DEFAULT_PACKAGE as KEYBOARD_PACKAGE
+from handqa.keys import Flavor, KeyNamingError, KeyResolutionError, LiveReadError, render, resolve_keymap
+from handqa.button_bar import DEFAULT_PACKAGE, ButtonBar, OverlayError
+from handqa.probe import bench_run, fault_summary
+from handqa.recording import RecordingError, recording
+from handqa.screen_gate import ScreenGate, require_serial
+from handqa.speech import Speaker
+from handqa.start_gate import StartGate, StartGateError, batch_instruction
+
+app = typer.Typer(add_completion=False, no_args_is_help=True)
+console = Console()
+
+# Names are added only after a watcher is proven on a device. A watcher may
+# click a dialog button. It must not change the IME. Each item is
+# (name, condition selector, click-target selector).
+PROVEN_WATCHERS: list[tuple[str, dict[str, object], dict[str, object]]] = [
+    # Pinnote asks for a rating every few launches and the modal blocks the field
+    # (seen 2026-11-24: every trial failed "input field not found"). Decline it.
+    (
+        "pinnote-rate-prompt",
+        {"resourceId": "branislav667.pinnote:id/alertTitle", "text": "Enjoying the app?"},
+        {"resourceId": "android:id/button2", "text": "Maybe later"},
+    ),
+]
+ANIMATION_SCALES = (
+    "window_animation_scale",
+    "transition_animation_scale",
+    "animator_duration_scale",
+)
+
+
+@app.command()
+def connect() -> None:
+    """Open FIRERPA and print version, uptime, and round-trip time."""
+    device = open_device()
+    status = require_version(device)
+    console.print(
+        f"FIRERPA v{status['version']} uptime={status['uptime_s']}s rtt={status['rtt_ms']}ms"
+    )
+
+
+def install_watchers(device: Any) -> None:
+    """Register the proven dialog watchers and turn the watcher loop on."""
+    for name, conditions, target in PROVEN_WATCHERS:
+        try:
+            device.remove_watcher(name)  # an earlier run's copy stays on the phone; re-register it fresh
+        except Exception:
+            pass
+        device.register_click_target_selector_watcher(name, [Selector(**conditions)], Selector(**target))
+        device.set_watcher_enabled(name, True)
+    device.set_watcher_loop_enabled(True)
+
+
+@app.command()
+def watchers() -> None:
+    """Register the proven dialog watchers only (no settings change) and say whether the dialogs are on screen."""
+    device = open_device()
+    install_watchers(device)
+    time.sleep(8.0)  # the watcher loop takes a few seconds to notice a dialog
+    for name, conditions, _target in PROVEN_WATCHERS:
+        shown = device(**{key: value for key, value in conditions.items() if key == "resourceId"}).exists()
+        console.print(f"{name}: dialog still on screen={shown}", markup=False)
+
+
+@app.command()
+def prep() -> None:
+    """Zero animator scales and enable the UI watcher loop."""
+    device = open_device()
+    settings = device.stub("Settings")
+    for name in ANIMATION_SCALES:
+        settings.put_global(name, "0")
+    install_watchers(device)
+    console.print(
+        f"animator scales 0; watcher loop on; proven watchers={len(PROVEN_WATCHERS)}"
+    )
+
+
+@app.command()
+def run(
+    suite: Path,
+    record: bool = typer.Option(
+        True,
+        "--record/--no-record",
+        help="Record the screen and the spoken prompts to an mp4 (default). The start card says so and the person "
+        "can start without it (No rec on the bar, or norec in the terminal).",
+    ),
+    panel: bool = typer.Option(
+        True,
+        "--panel/--no-panel",
+        help="When recording: put the terminal log beside the phone and add it as a switchable subtitle track.",
+    ),
+    record_dir: Path | None = typer.Option(
+        None, "--record-dir", help="Where the mp4 goes (default: HANDQA_RECORD_DIR or ~/handqa-recordings)."
+    ),
+    bar: bool = typer.Option(
+        True,
+        "--bar/--no-bar",
+        help="Use the on-screen Done/Next/Stop bar (default); a trial ends on Done and the batch starts only on its Done "
+        "or a typed go. --no-bar: the notification-shade card, a trial ends when the text matches.",
+    ),
+    bar_package: str = typer.Option(
+        DEFAULT_PACKAGE, "--bar-package", envvar="HANDQA_BAR_PACKAGE", help="Package of the button-bar app."
+    ),
+    redo: bool = typer.Option(
+        False, "--redo", help="Run every trial again, also those that already passed on this keyboard build."
+    ),
+    more_coming: bool = typer.Option(
+        False,
+        "--more-coming",
+        help="Another batch follows this one: at the end the person is told to wait and leave the phone. Without "
+        "it they are told the phone may be used normally. If the promised batch will not run: handqa release.",
+    ),
+) -> None:
+    """Run a YAML suite. A person drives the phone; the host prepares fields and checks output.
+
+    A trial that already passed on the installed keyboard build is skipped; its clip stays in the
+    final video (`handqa video`). Failed or unfinished trials run again."""
+    if bar_package == DEFAULT_PACKAGE:
+        bar_package = env_get("BAR_PACKAGE", legacy="BAR_PACKAGE", default=DEFAULT_PACKAGE)
+    target = require_serial()
+    try:
+        resolved = resolve_keymap(on_live_failure="error")
+        console.print(resolved.describe(), markup=False)
+        all_trials, repeat_reason = read_suite(suite, resolved.keymap)
+        build = _keyboard_build(target)
+    except (KeyNamingError, KeyResolutionError, LiveReadError, ValueError, BuildError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if record:
+        missing = [tool for tool in ("scrcpy", "ffmpeg") if not shutil.which(tool)]
+        if missing:
+            typer.echo(
+                f"refused: recording needs {', '.join(missing)} on PATH (macOS: brew install scrcpy ffmpeg), "
+                "or pass --no-record",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+    serial = runlock.device_serial(target)  # the phone's own serial: LAN, Tailscale and USB share one lock
+    try:
+        runlock.acquire(serial)
+    except runlock.RunLockError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    try:
+        _run_locked(
+            suite, all_trials, build, target, serial, record, panel, record_dir, bar, bar_package, redo,
+            more_coming=more_coming, repeat_reason=repeat_reason,
+        )
+    finally:
+        runlock.release(serial)
+
+
+def _run_locked(
+    suite: Path, all_trials: list[Any], build: str, target: str, serial: str, record: bool, panel: bool,
+    record_dir: Path | None, bar: bool, bar_package: str, redo: bool,
+    more_coming: bool = False, repeat_reason: str = "",
+) -> None:
+    ledger = Ledger(suite.stem, build)
+    trials = all_trials
+    if not redo:
+        trials = plan_trials(all_trials, ledger.passed)
+        done = len(all_trials) - len(trials)
+        if done:
+            console.print(
+                f"{done} of {len(all_trials)} trials already passed on this keyboard build and are skipped "
+                "(--redo runs them again).", markup=False,
+            )
+        if not trials:
+            console.print("nothing left to run.", markup=False)
+            console.print(RELEASE_HINT, markup=False)
+            _write_final(ledger, all_trials, suite, record_dir)
+            return
+    by_number = {trial.number: trial for trial in trials}
+    controller = ScreenController(open_device())
+    install_watchers(controller.device)
+    gate = ScreenGate(
+        target, allowed_packages=allowed_packages(all_trials), overlay_package=bar_package if bar else None
+    )
+    speaker = Speaker()
+    console.print(f"voice: {speaker.backend} (HANDQA_VOICE=auto|kokoro|say|espeak|off)")
+    got: dict[int, Any] = {}  # latest result per trial: a redo replaces it
+    recorder = None
+    notice = EndNotice(target, more_coming=more_coming, speaker=speaker, console=console)
+
+    def on_trial(number: int, trial: Any) -> None:
+        if recorder is not None:
+            recorder.on_trial(number, trial)
+        runlock.note_children(serial)
+
+    def on_result(number: int, result: Any) -> None:
+        got[number] = result
+        if recorder is not None:
+            recorder.on_result(number, result)
+        trial = by_number.get(number)
+        if result.passed and trial is not None:
+            ledger.record(trial, result.observed, None)  # at once: a kill later does not lose it
+
+    def on_redo(trial: Any) -> None:
+        got.pop(trial.number, None)
+        ledger.forget(trial)
+        if recorder is not None:
+            recorder.withdraw(trial.number)
+
+    def on_discard(number: int, trial: Any) -> None:
+        if recorder is not None:
+            recorder.on_discard(number, trial)
+
+    def hand_back() -> None:
+        # No longer filmed: restore the phone and tell the person now, not after the video is written.
+        gate.__exit__(None, None, None)
+        notice.finish(gate)
+
+    interrupted = False
+    finishing_recording = False
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        already_interrupted = interrupted
+        interrupted = True
+        notice.stopped = True
+        # A wrapper can forward the same TERM a second time. Let capture and muxing finish.
+        if not already_interrupted and not finishing_recording:
+            raise KeyboardInterrupt(f"signal {signum}")
+
+    old_handlers = {
+        sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        with ExitStack() as stack:
+            button_bar = None
+            if bar:
+                button_bar = stack.enter_context(ButtonBar(target, package=bar_package))
+            else:
+                ButtonBar(target, package=bar_package).hide_blind()  # a bar left by an earlier run
+                stack.callback(ButtonBar(target, package=bar_package).hide_blind)
+            # The person's last word. Registered here, so it runs after the gate has restored the phone
+            # and while the bar is still there, however the batch ends.
+            notice.bar = button_bar
+            stack.callback(notice.finish, gate)
+            # Test bench trials need its app: refuse before the person is asked to start.
+            probe = stack.enter_context(bench_run(target, all_trials, suite.stem, record_dir))
+            # Preflight before the person is asked to start: unlock, heads-up, stop card, the foreground app.
+            stack.enter_context(gate)
+            gate.yield_to_human("", shade=False)  # ordinary colors for the go
+            start = StartGate(target, speaker=speaker, console=console, bar=button_bar)
+            notice.starting()  # an earlier batch's "done" or "wait" card no longer holds
+            start.wait(
+                f"handqa: {suite.name}", batch_instruction(len(trials)), recording=record,
+                repeat_reason=repeat_reason,
+            )
+            notice.started = True
+            if record and start.record_declined:
+                record = False
+                console.print("not recording: the person started the run without it.", markup=False)
+            with recording(target, speaker, record, record_dir, panel=panel, captured=hand_back) as recorder:
+                if recorder is not None:
+                    voice = "with the voice" if speaker.enabled else "video only (voice is off)"
+                    console.print(f"recording the screen {voice} to {recorder.output}")
+                    runlock.note_children(serial)
+                try:
+                    run_chord_batch(
+                        controller, trials, console, gate, speaker,
+                        on_trial=on_trial, on_result=on_result, overlay=button_bar, gate_entered=True,
+                        on_redo=on_redo, on_discard=on_discard, probe=probe, notice=notice,
+                    )
+                finally:
+                    finishing_recording = True
+                    if interrupted:
+                        notice.stopped = True
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("interrupted: passes so far are kept.", markup=False)
+        if not notice.started:
+            console.print(RELEASE_HINT, markup=False)
+    except (RecordingError, StartGateError, OverlayError, RuntimeError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        if not notice.started:
+            typer.echo(RELEASE_HINT, err=True)
+        raise typer.Exit(code=2) from exc
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+    if recorder is not None:
+        for warning in recorder.warnings:
+            console.print(f"recording: {warning}", markup=False)
+        if recorder.output.is_file():
+            console.print(f"recording saved: {recorder.output}", markup=False)
+        latest = {span[0].number: span for span in recorder.spans}  # a redone trial: only the last attempt
+        for trial, began, ended, passed, _result in latest.values():
+            if not passed:
+                continue
+            dest = ledger.clip_path(trial)
+            if recorder.output.is_file() and cut_clip(recorder.output, began, ended + TAIL_S, dest):
+                ledger.attach_clip(trial, dest)
+            else:
+                ledger.forget(trial)  # recorded run: a pass with no clip does not count
+                console.print(f"trial {trial.number}: clip could not be cut, so it is not counted as passed", markup=False)
+    _write_final(ledger, all_trials, suite, record_dir)
+    failed = [item for item in got.values() if not item.passed]
+    for item in failed:
+        console.print(
+            f"fail {item.number} {item.phase} | {item.prompt} | expect={item.expect!r} "
+            f"observed={item.observed!r} error={item.error}"
+            + (f" fault={item.fault}" if item.fault else "")
+        )
+    summary = fault_summary(failed)
+    if summary:
+        console.print(summary, markup=False)
+    logs = sorted({str(Path(item.probe_log).parent) for item in got.values() if item.probe_log})
+    for folder in logs:
+        console.print(f"test bench lines and reports: {folder}", markup=False)
+    if interrupted:
+        raise typer.Exit(code=130)
+    if failed:
+        raise typer.Exit(code=1)
+
+
+def _keyboard_build(target: str) -> str:
+    """The installed keyboard build, or BuildError if unreadable or mismatched."""
+    return require_keyboard_build(ime_build(target), keyboard_package())
+
+
+def _write_final(ledger: Ledger, trials: list[Any], suite: Path, record_dir: Path | None) -> None:
+    """Join the clips of the passed trials, in suite order, into one video; say what is still open."""
+    configured = env_get("RECORD_DIR", legacy="RECORD_DIR")
+    out_dir = record_dir or (Path(configured).expanduser() if configured else Path.home() / "handqa-recordings")
+    dest = out_dir / f"{suite.stem}-final.mp4"
+    written, missing, no_clip = final_video(ledger, trials, dest)
+    if written:
+        console.print(f"video of the passed trials: {dest}", markup=False)
+    if no_clip:
+        console.print(
+            f"passed, no clip ({len(no_clip)}; --redo to film them): "
+            + "; ".join(f"{t.number}. {t.prompt}" for t in no_clip), markup=False,
+        )
+    if missing:
+        console.print(
+            f"still to pass ({len(missing)}): " + "; ".join(f"{t.number}. {t.prompt}" for t in missing), markup=False
+        )
+    elif not no_clip:
+        console.print("every trial has passed on this keyboard build.", markup=False)
+
+
+@app.command()
+def video(suite: Path, record_dir: Path | None = typer.Option(None, "--record-dir")) -> None:
+    """Rebuild the final video of a suite from the clips of its passed trials."""
+    try:
+        trials = load_suite(suite, resolve_keymap(on_live_failure="error").keymap)
+    except (KeyNamingError, KeyResolutionError, LiveReadError, ValueError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    try:
+        build = _keyboard_build(require_serial())
+    except BuildError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    _write_final(Ledger(suite.stem, build), trials, suite, record_dir)
+
+
+@app.command("import")
+def import_recording(
+    suite: Path,
+    recording_file: Path,
+    passed: str = typer.Option(..., "--passed", help="Trial numbers that passed in that run, e.g. 2,3,4,5."),
+) -> None:
+    """Add trials that passed in an earlier recording (cut by its chapters) to the ledger."""
+    try:
+        trials = load_suite(suite, resolve_keymap(on_live_failure="error").keymap)
+    except (KeyNamingError, KeyResolutionError, LiveReadError, ValueError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_chapters", "-show_format", "-of", "json", str(recording_file)],
+        capture_output=True, text=True, check=True,
+    )
+    info = json.loads(probe.stdout)
+    length = float(info["format"]["duration"])
+    marks = [(int(c["tags"]["title"].split(".")[0]), float(c["start_time"])) for c in info.get("chapters", [])
+             if c.get("tags", {}).get("title", "")[:1].isdigit()]
+    marks.sort(key=lambda m: m[1])
+    try:
+        build = _keyboard_build(require_serial())
+    except BuildError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    ledger = Ledger(suite.stem, build)
+    for number in (int(n) for n in passed.split(",")):
+        found = [i for i, m in enumerate(marks) if m[0] == number]
+        if not found or not 1 <= number <= len(trials):
+            console.print(f"trial {number}: no chapter in the recording, skipped", markup=False)
+            continue
+        i = found[-1]  # a redone trial has one chapter per attempt: the last one counts
+        end = marks[i + 1][1] if i + 1 < len(marks) else length
+        trial = trials[number - 1]
+        dest = ledger.clip_path(trial)
+        if cut_clip(recording_file, marks[i][1], end, dest):
+            ledger.record(trial, trial.expect, dest)
+            console.print(f"trial {number} added: {trial.prompt}", markup=False)
+        else:
+            console.print(f"trial {number}: could not cut the clip", markup=False)
+
+
+@app.command()
+def release(
+    bar_package: str = typer.Option(
+        DEFAULT_PACKAGE, "--bar-package", envvar="HANDQA_BAR_PACKAGE", help="Package of the button-bar app."
+    ),
+) -> None:
+    """Tell the person that no more batches are coming: the phone may be used normally.
+
+    For a batch announced with --more-coming that will not run. Posts the notification, says it and
+    shows it on the button bar. Refused while a run is driving the phone."""
+    if bar_package == DEFAULT_PACKAGE:
+        bar_package = env_get("BAR_PACKAGE", legacy="BAR_PACKAGE", default=DEFAULT_PACKAGE)
+    target = require_serial()
+    try:
+        notice = end_state.release(target, console=console, bar_package=bar_package)
+    except runlock.RunLockError as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not notice.posted:
+        typer.echo("release failed: the notification could not be posted on the phone", err=True)
+        raise typer.Exit(code=1)
+    console.print("the phone has been released.", markup=False)
+
+
+@app.command()
+def ui(
+    open_: str = typer.Option("", "--open", help="Open PACKAGE/ACTIVITY first."),
+    click: str = typer.Option("", "--click", help="Click this resource id next, then wait a second."),
+    all_nodes: bool = typer.Option(False, "--all", help="Print every node, not only interactive or labelled ones."),
+) -> None:
+    """Print the foreground app and the screen's nodes (to debug a trial that cannot find its field).
+
+    Read-only unless you pass --open or --click, which drive the phone: only with the person's say-so.
+    """
+    from xml.etree import ElementTree
+
+    device = open_device()
+    if open_:
+        package, _, activity = open_.partition("/")
+        ScreenController(device).teleport_to_activity(package, activity)
+        time.sleep(1.5)
+    if click:
+        device(resourceId=click).click()
+        time.sleep(1.0)
+    app = device.current_application()
+    console.print(f"{app.applicationId} {getattr(app, 'activity', '')}", markup=False)
+    root = ElementTree.fromstring(device.dump_window_hierarchy().read())
+    for node in root.iter():
+        a = node.attrib
+        if a.get("resource-id", "").startswith("com.android.systemui"):
+            continue
+        wanted = all_nodes or a.get("clickable") == "true" or a.get("focused") == "true" or a.get("text") or a.get("resource-id")
+        if wanted:
+            console.print(
+                f"{a.get('resource-id', '')} | {a.get('class', '')} | {a.get('text', '')!r} | {a.get('bounds', '')}"
+                f"{' | focused' if a.get('focused') == 'true' else ''}",
+                markup=False,
+            )
+
+
+@app.command()
+def mcp() -> None:
+    """Serve handqa-mcp on stdio."""
+    from handqa.mcp_server import main
+
+    main()
+
+
+@app.command("render")
+def render_keys(
+    text: str = typer.Argument(..., help='Text with key tokens, e.g. "<Ctrl+A>, then <Ctrl+C>"'),
+    as_json: bool = typer.Option(False, "--json", help="Print one JSON object instead of lines."),
+) -> None:
+    """Print the screen, shade and spoken versions of text with key tokens.
+
+    Uses the phone's live keymap when ADB_TARGET is set (read-only), else the
+    profile (HANDQA_KEYMAP, default profiles/plektra/keymaps/titan2-elite-baseline.yaml).
+    """
+    try:
+        resolved = resolve_keymap()
+        versions = {
+            flavor.value: render(text, resolved.keymap, flavor) for flavor in Flavor
+        }
+    except (KeyNamingError, KeyResolutionError, LiveReadError, ValueError) as exc:
+        typer.echo(f"refused: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if as_json:
+        typer.echo(json.dumps({"keymap": resolved.describe(), **versions}, ensure_ascii=False))
+        return
+    typer.echo(resolved.describe())
+    for name, value in versions.items():
+        typer.echo(f"{name}: {value}")

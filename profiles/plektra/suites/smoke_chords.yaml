@@ -1,0 +1,53 @@
+name: smoke_chords
+# Spoken prompts: quiet seconds before the action is said again, and how often.
+start_wait_s: 10
+sentinel: "\n"
+phases:
+  - name: one_screen
+    # Pinnote's body field. The first trial opens the list and adds a note
+    # when that field is not already on screen.
+    resource_id: branislav667.pinnote:id/pin_text
+    trials:
+      - prompt: "alpha: hello"
+        shade: "Type hello"
+        expect: "Hello"  # Plektra autocapitalizes the first letter
+        fresh: true  # the one autocap trial: always starts from a new, empty note
+        package: branislav667.pinnote
+        activity: branislav667.pinnote.NotesActivity
+        click_resource_id: branislav667.pinnote:id/notes_fab
+      - prompt: "digits: 42"
+        shade: "Type 42"
+        speak: "Type the digits four, two."
+        expect: "42"
+        expect_ci_first: true
+      - prompt: "punctuation: a, b."
+        shade: "Type a, b."
+        speak: "Type: a, comma, space, b, period."
+        expect: "a, b."
+        expect_ci_first: true
+      # Keys are tokens: <Ctrl+A>, <Tab|Enter> (either). See README, "Naming keys".
+      - prompt: "type no, use <Backspace> twice, then type ok"
+        shade: "Type no, then <Backspace> twice, then type ok"
+        expect: "ok"
+        expect_ci_first: true  # autocap state is not what this trial tests
+  - name: two_fields
+    trials:
+      - prompt: "field A: alpha"
+        shade: "Type alpha"
+        expect: "alpha"
+        expect_ci_first: true
+        resource_id: branislav667.pinnote:id/pin_text
+        # Copied to the first pending trial of the phase, so a later one run alone still opens a note.
+        package: branislav667.pinnote
+        activity: branislav667.pinnote.NotesActivity
+        click_resource_id: branislav667.pinnote:id/notes_fab
+      - prompt: "<Tab|Enter> on Plektra, then type beta"
+        shade: "<Tab|Enter>, then type beta"
+        expect: "Beta"  # a leading newline (Enter) or tab (Tab) is ignored; the first letter's case is not tested
+        expect_ci_first: true
+      - prompt: "<Ctrl+A>, then <Ctrl+C> on Plektra"
+        shade: "Select all and copy: <Ctrl+A>, then <Ctrl+C>"
+        expect: "Beta"
+        verify_mode: clipboard
+        clear_field: false
+        expect_ci_first: true
