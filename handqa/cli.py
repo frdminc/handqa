@@ -278,10 +278,7 @@ def _run_locked(
             if record and start.record_declined:
                 record = False
                 console.print("not recording: the person started the run without it.", markup=False)
-            with recording(
-                target, speaker, record, record_dir, panel=panel, captured=hand_back,
-                stop_requested=lambda: notice.stopped,
-            ) as recorder:
+            with recording(target, speaker, record, record_dir, panel=panel, captured=hand_back) as recorder:
                 if recorder is not None:
                     voice = "with the voice" if speaker.enabled else "video only (voice is off)"
                     console.print(f"recording the screen {voice} to {recorder.output}")

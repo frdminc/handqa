@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 6
+          fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
         with:
@@ -39,25 +39,16 @@ jobs:
           test "$status" -eq 1
           grep -F 'assert [0] == [1]' "$RUNNER_TEMP/shade-stop-before.txt"
           git restore --source HEAD handqa/hitl_runner.py
-      - name: Reproduce the speech drain on terminal interruption
+      - name: Reproduce delayed handback and narration beyond capture
         run: |
           set -euo pipefail
           git restore --source 354efd8df498f60066c22762bffaf5b987cd2644 handqa/recording.py
           status=0
-          uv run --locked --group dev pytest -q tests/test_recording.py -k stops_capture_on_interrupt > "$RUNNER_TEMP/interrupt-before.txt" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/interrupt-before.txt"
+          uv run --locked --group dev pytest -q tests/test_recording.py -k 'stops_capture_before_handback or view_only_video_with_the_voice_laid_on_it' > "$RUNNER_TEMP/handback-before.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/handback-before.txt"
           test "$status" -eq 1
-          grep -F "'wait for speech' != 'stop capture'" "$RUNNER_TEMP/interrupt-before.txt"
+          grep -F "'wait for speech' != 'stop capture'" "$RUNNER_TEMP/handback-before.txt"
+          grep -F '3 failed' "$RUNNER_TEMP/handback-before.txt"
           git restore --source HEAD handqa/recording.py
-      - name: Reproduce waiting for narration after terminal Stop
-        run: |
-          set -euo pipefail
-          git restore --source HEAD^ handqa/cli.py handqa/recording.py handqa/speech.py
-          status=0
-          uv run --locked --group dev pytest -q tests/test_fixes.py -k sigterm_during_final_narration > "$RUNNER_TEMP/final-stop-before.txt" 2>&1 || status=$?
-          cat "$RUNNER_TEMP/final-stop-before.txt"
-          test "$status" -eq 1
-          grep -F 'AssertionError: capture waited for narration after SIGTERM' "$RUNNER_TEMP/final-stop-before.txt"
-          git restore --source HEAD handqa/cli.py handqa/recording.py handqa/speech.py
       - name: Verify the fixed runner
         run: uv run --locked --group dev pytest -q

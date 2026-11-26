@@ -1,5 +1,6 @@
 import signal
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,13 +99,14 @@ def _recorder(tmp_path, calls, which=lambda name: f"/usr/bin/{name}", writes=Tru
     return recorder, holder
 
 
-def test_recording_is_view_only_video_with_the_voice_laid_on_it(tmp_path, _encode_is_faked):
+def test_recording_is_view_only_video_with_the_voice_laid_on_it(tmp_path, monkeypatch, _encode_is_faked):
     calls: list[list[str]] = []
     recorder, holder = _recorder(tmp_path, calls)
     recorder.start()
     wav = tmp_path / "line.wav"
     wav.write_bytes(b"w")
     recorder.on_speech("say", time=recorder._t0 + 1.0, text="Type hello", kind="wav", path=wav)
+    monkeypatch.setattr(recorder, "_clock", lambda: recorder._t0 + 1.05)
     out = recorder.finish()
     assert out == tmp_path / "handqa-t.mp4" and out.is_file()
     assert holder["proc"].signals == [signal.SIGINT]
@@ -113,6 +115,7 @@ def test_recording_is_view_only_video_with_the_voice_laid_on_it(tmp_path, _encod
     cmd = _encode_is_faked[0]["cmd"]
     assert "-c:a" in cmd and "-c:v" in cmd and "-filter_complex" in cmd
     assert "vstack" in cmd[cmd.index("-filter_complex") + 1]
+    assert cmd[cmd.index("-t") + 1] == "1.05"
 
 
 def test_scrcpy_is_launched_view_only_and_without_phone_audio(tmp_path):
@@ -224,7 +227,8 @@ def test_recording_context_wires_and_unwires_the_speaker_and_waits_for_it(tmp_pa
     assert real is not build
 
 
-def test_recording_stops_capture_on_interrupt_without_waiting_for_speech(monkeypatch):
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_recording_stops_capture_before_handback_without_waiting_for_speech(monkeypatch, interrupted):
     events = []
     recorder = SimpleNamespace(
         start=lambda: events.append("start"),
@@ -235,9 +239,11 @@ def test_recording_stops_capture_on_interrupt_without_waiting_for_speech(monkeyp
     monkeypatch.setattr(rec, "Recorder", lambda *_args, **_kwargs: recorder)
     speaker = SimpleNamespace(listener=None, wait_idle=lambda _timeout: events.append("wait for speech"))
 
-    with pytest.raises(KeyboardInterrupt):
+    outcome = pytest.raises(KeyboardInterrupt) if interrupted else nullcontext()
+    with outcome:
         with recording("S", speaker, True, captured=lambda: events.append("hand back")):
-            raise KeyboardInterrupt
+            if interrupted:
+                raise KeyboardInterrupt
 
     assert speaker.listener is None
     assert events == ["start", "stop capture", "hand back", "finish"]
