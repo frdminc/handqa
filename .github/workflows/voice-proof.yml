@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
         with:
@@ -39,5 +39,15 @@ jobs:
           test "$status" -eq 1
           grep -F 'assert [0] == [1]' "$RUNNER_TEMP/shade-stop-before.txt"
           git restore --source HEAD handqa/hitl_runner.py
+      - name: Reproduce the speech drain on terminal interruption
+        run: |
+          set -euo pipefail
+          git restore --source 354efd8df498f60066c22762bffaf5b987cd2644 handqa/recording.py
+          status=0
+          uv run --locked --group dev pytest -q tests/test_recording.py -k stops_capture_on_interrupt > "$RUNNER_TEMP/interrupt-before.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/interrupt-before.txt"
+          test "$status" -eq 1
+          grep -F "'wait for speech' != 'stop capture'" "$RUNNER_TEMP/interrupt-before.txt"
+          git restore --source HEAD handqa/recording.py
       - name: Verify the fixed runner
         run: uv run --locked --group dev pytest -q

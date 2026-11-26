@@ -496,9 +496,10 @@ def recording(
 ) -> Iterator[Recorder | None]:
     """Record around a run when `enabled`; otherwise do nothing. Never prints.
 
-    Raises RecordingError before the run if recording cannot start. After the
-    run it waits for the last spoken line to finish, then writes the file;
-    read `.output` and `.warnings` on the yielded Recorder afterwards.
+    Raises RecordingError before the run if recording cannot start. On normal
+    completion it waits for the last spoken line before stopping capture.
+    If the run raises, it stops capture without waiting. Read `.output` and
+    `.warnings` on the yielded Recorder afterwards.
     `captured` runs once the phone is no longer filmed, before the file is written (which takes a while).
     """
     if not enabled:
@@ -510,10 +511,10 @@ def recording(
         speaker.listener = recorder.on_speech
     try:
         yield recorder
-    finally:
         wait = getattr(speaker, "wait_idle", None)
         if callable(wait):
             wait(IDLE_TIMEOUT_S)
+    finally:
         if hasattr(speaker, "listener"):
             speaker.listener = None
         recorder.stop_capture()
