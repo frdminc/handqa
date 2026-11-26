@@ -1,0 +1,33 @@
+name: HandQA voice regression verification
+
+on:
+  push:
+    branches: [ci/voice-while-typing-20261126]
+
+permissions:
+  contents: read
+
+jobs:
+  voice-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
+        with:
+          enable-cache: false
+      - name: Reproduce the cut on the previous runner
+        run: |
+          set -euo pipefail
+          git restore --source 354efd8df498f60066c22762bffaf5b987cd2644 handqa/hitl_runner.py
+          status=0
+          uv run --locked --group dev pytest -q tests/test_speech.py -k typing_ends_reprompts_without_cutting > "$RUNNER_TEMP/before.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/before.txt"
+          test "$status" -eq 1
+          grep -F 'assert [1] == [0]' "$RUNNER_TEMP/before.txt"
+          git restore --source HEAD handqa/hitl_runner.py
+      - name: Verify the fixed runner
+        run: uv run --locked --group dev pytest -q
