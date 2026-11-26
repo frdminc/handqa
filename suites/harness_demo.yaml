@@ -1,6 +1,5 @@
 name: harness_demo
 start_wait_s: 20
-max_reprompts: 2
 phases:
   - name: harness_demo
     package: dev.hitlbar.overlay
