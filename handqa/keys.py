@@ -484,6 +484,12 @@ class _KeycapWriter:
         return f"Keycaps: {joiner.join(parts)}."
 
 
+_LEADING_KEY_VERB_RE = re.compile(
+    r"\b(?:double[\s-]tap|long[\s-]press|tap|press|hit|hold)\s+$", re.I
+)
+_GENERIC_CHORD_VERB_RE = re.compile(r"\b(?:tap|press|hit)\s+$", re.I)
+
+
 def _render_inline(text: str, tokens: list[Token], keymap: Keymap, flavor: Flavor, context: str) -> str:
     """The phone bar and the voice: each key token becomes the physical action, in place.
 
@@ -496,8 +502,14 @@ def _render_inline(text: str, tokens: list[Token], keymap: Keymap, flavor: Flavo
     writer.hints = not shade
     out, last = [], 0
     for token in tokens:
-        out.append(text[last:token.start])
-        action = " or ".join(writer.chord(chord, token.raw) for chord in token.alternatives)
+        prefix = text[last:token.start]
+        parts = [writer.chord(chord, token.raw) for chord in token.alternatives]
+        if all(p.startswith("tap ") for p in parts) and _LEADING_KEY_VERB_RE.search(prefix):
+            parts = [p[len("tap ") :] for p in parts]
+        elif all(p.startswith("hold ") for p in parts) and _GENERIC_CHORD_VERB_RE.search(prefix):
+            prefix = _GENERIC_CHORD_VERB_RE.sub("", prefix)
+        out.append(prefix)
+        action = " or ".join(parts)
         if shade:
             names = " or ".join("+".join([*chord.mods, chord.key]) for chord in token.alternatives)
             action = f"{action} ({names})"

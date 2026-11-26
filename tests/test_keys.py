@@ -94,6 +94,26 @@ def test_render_without_tokens_is_unchanged():
     assert render("Type a, comma, b.", BASELINE, Flavor.SPOKEN) == "Type a, comma, b."
 
 
+def test_render_inline_does_not_double_preceding_key_verbs():
+    assert render("Tap <Ctrl> once.", BASELINE, Flavor.SHADE) == "Tap Fn (Ctrl) once."
+    assert render("Tap <Ctrl> once.", BASELINE, Flavor.SPOKEN) == "Tap the key printed F N once."
+    assert render("Double-tap <Alt>.", BASELINE, Flavor.SHADE) == "Double-tap Alt (Alt)."
+    assert render("Double-tap <Alt>.", BASELINE, Flavor.SPOKEN) == "Double-tap the key printed Alt."
+    assert render("Press <Backspace> once.", BASELINE, Flavor.SHADE) == "Press ⌫ (Backspace) once."
+    assert render("Press <Backspace> once.", BASELINE, Flavor.SPOKEN) == "Press the backspace key once."
+    assert render("Press <Tab|Enter>.", BASELINE, Flavor.SHADE) == "Press □ or right ⇧ (Tab or Enter)."
+    assert render("Press <Ctrl+A>.", BASELINE, Flavor.SHADE) == "Hold Fn, tap A (Ctrl+A)."
+    assert render("Press <Ctrl+A>.", BASELINE, Flavor.SPOKEN) == "Hold the key printed F N, tap letter A."
+    # Bare tokens without a preceding verb still include "tap".
+    assert render("Then <Ctrl>.", BASELINE, Flavor.SHADE) == "Then tap Fn (Ctrl)."
+    assert render("Then <Ctrl>.", BASELINE, Flavor.SPOKEN) == "Then tap the key printed F N."
+
+
+def test_harness_demo_suite_does_not_set_max_reprompts():
+    trials = load_suite(ROOT / "suites" / "harness_demo.yaml", BASELINE)
+    assert trials and all(t.max_reprompts is None for t in trials)
+
+
 def test_render_function_keys_and_alternatives():
     assert screen("Press <Backspace>") == "Press your Backspace. Keycaps: tap ⌫."
     out = screen("<Tab|Enter> on Plektra")
