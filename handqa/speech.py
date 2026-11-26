@@ -207,10 +207,12 @@ class Speaker:
             self._tool = cmd[0]
             self._announce(text, cmd, rate)
 
-    def wait_idle(self, timeout_s: float) -> None:
-        """Block until the line being said has finished, or the timeout."""
+    def wait_idle(self, timeout_s: float, *, stop_requested: Callable[[], bool] | None = None) -> None:
+        """Wait for the current line, a stop request, or the timeout."""
         deadline = time.monotonic() + timeout_s
         while self.speaking() and time.monotonic() < deadline:
+            if stop_requested is not None and stop_requested():
+                return
             time.sleep(0.05)
 
     def speaking(self) -> bool:

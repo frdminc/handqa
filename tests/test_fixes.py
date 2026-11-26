@@ -448,6 +448,35 @@ def test_a_second_sigterm_during_recording_cleanup_does_not_interrupt_it(monkeyp
     assert result.exit_code == 130
 
 
+def test_sigterm_during_final_narration_stops_capture_before_muxing(monkeypatch, tmp_path):
+    from handqa import recording as rec
+
+    events = []
+    recorder = SimpleNamespace(
+        output=tmp_path / "recording.mp4", warnings=[], spans={},
+        start=lambda: events.append("start"),
+        on_speech=lambda *_args, **_kwargs: None,
+        stop_capture=lambda: events.append("stop capture"),
+        finish=lambda: events.append("mux"),
+    )
+
+    def speaking(_speaker):
+        assert "SIGTERM" not in events, "capture waited for narration after SIGTERM"
+        events.append("SIGTERM")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return True
+
+    _patch_cli(monkeypatch, tmp_path, batch=lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli, "recording", rec.recording)
+    monkeypatch.setattr(rec, "Recorder", lambda *_args, **_kwargs: recorder)
+    monkeypatch.setattr(cli.Speaker, "speaking", speaking)
+
+    result = CliRunner().invoke(cli.app, ["run", str(SUITE), "--no-bar"])
+
+    assert result.exit_code == 130, result.exception
+    assert events == ["start", "SIGTERM", "stop capture", "mux"]
+
+
 def test_bar_is_the_default_for_run():
     import inspect
 
