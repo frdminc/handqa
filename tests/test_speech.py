@@ -151,7 +151,7 @@ def test_shade_stop_cuts_the_voice_after_typing(monkeypatch):
     cuts_at_result = []
     results = run_chord_batch(
         ScreenController(_Device(field)),
-        [ChordTrial(prompt="alpha: hello", expect="hello", speak="Type hello now")],
+        [ChordTrial(prompt="alpha: hello world", expect="hello world", speak="Type hello world now")],
         _console(),
         _Gate(),
         speaker,

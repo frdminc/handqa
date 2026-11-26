@@ -224,6 +224,25 @@ def test_recording_context_wires_and_unwires_the_speaker_and_waits_for_it(tmp_pa
     assert real is not build
 
 
+def test_recording_stops_capture_on_interrupt_without_waiting_for_speech(monkeypatch):
+    events = []
+    recorder = SimpleNamespace(
+        start=lambda: events.append("start"),
+        on_speech=lambda *_args, **_kwargs: None,
+        stop_capture=lambda: events.append("stop capture"),
+        finish=lambda: events.append("finish"),
+    )
+    monkeypatch.setattr(rec, "Recorder", lambda *_args, **_kwargs: recorder)
+    speaker = SimpleNamespace(listener=None, wait_idle=lambda _timeout: events.append("wait for speech"))
+
+    with pytest.raises(KeyboardInterrupt):
+        with recording("S", speaker, True, captured=lambda: events.append("hand back")):
+            raise KeyboardInterrupt
+
+    assert speaker.listener is None
+    assert events == ["start", "stop capture", "hand back", "finish"]
+
+
 def test_speaker_reports_lines_and_cuts_to_its_listener(tmp_path):
     class Proc:
         def __init__(self):
